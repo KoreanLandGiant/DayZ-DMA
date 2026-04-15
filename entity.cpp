@@ -7,6 +7,8 @@
 #include <mutex>
 #include <vector>
 #include <set>
+#include <memory>
+#include <unordered_map>
 #include <Windows.h>
 #include "SDK.h"
 #include "settings.h"
@@ -19,7 +21,8 @@
 
 #define UENGINE __stdcall
 
-std::vector<player_t> entities = {};
+// Single-thread entity storage — no mutex needed, updated inline before render
+std::vector<player_t> g_entities;
 std::vector<item_t> items = {};
 
 class USQAnimInstanceSoldier1P1
@@ -42,8 +45,7 @@ const int screenWidth = 1440;
 const int screenHeight = 900;
 const float fovRadians = 0.785398; // Aproximadamente 45 graus em radianos
 
-std::mutex entitiesMutex; // Mutex para proteger o acesso às entidades
-std::mutex itemsMutex;    // Mutex para proteger o acesso aos itens
+// Single-thread: no mutexes needed
 
 std::vector<uintptr_t*> valid_players;
 std::vector<uintptr_t*> valid_LootTP;
@@ -58,6 +60,9 @@ void keyboard_listener();
 // Defined in main.cpp
 extern void Log(const char* msg);
 extern void Log(const std::string& msg);
+
+// Forward declarations
+void UpdateItemCache(uintptr_t pUWorld);
 
 void init()
 {
@@ -103,11 +108,10 @@ void init()
         return;
     }
 
-    Log("[11 ] Starting threads...");
-    std::thread(update_list).detach();
+    Log("[11 ] Starting keyboard listener...");
     std::thread(keyboard_listener).detach();
 
-    Log("[12 ] init() complete");
+    Log("[12 ] init() complete — entity updates run inline with render");
 }
 
 void DrawBoxFilledmod(const DirectX::XMFLOAT2& from, const DirectX::XMFLOAT2& size, DirectX::XMFLOAT4 color, float rounding)
@@ -155,6 +159,7 @@ float sqrtf1(float _X) {
     return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(_X)));
 }
 
+// Zero-DMA version: uses cached bone positions (single-thread, direct access)
 uintptr_t* get_closest_player(std::vector<uintptr_t*> list, float field_of_view)
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -164,34 +169,21 @@ uintptr_t* get_closest_player(std::vector<uintptr_t*> list, float field_of_view)
 
     for (auto curr_entity : list)
     {
-
-        uint64_t Skeleton = 0;
-
-        if (GameVars.SilentAimZ) {
-            Skeleton = ReadData<uint64_t>((uint64_t)curr_entity + OFF_PlayerSkeleton);
-
-            if (!Game::IsValidPtr2((void*)Skeleton)) {
-                Skeleton = ReadData<uint64_t>((uint64_t)curr_entity + OFF_ZmSkeleton);
-                if (!Game::IsValidPtr2((void*)Skeleton))
-                    continue;
+        const player_t* cached = nullptr;
+        for (const auto& e : g_entities) {
+            if (e.EntityPtr == (uint64_t)curr_entity) {
+                cached = &e;
+                break;
             }
         }
-        else {
-            Skeleton = ReadData<uint64_t>((uint64_t)curr_entity + OFF_PlayerSkeleton);
-            if (!Game::IsValidPtr2((void*)Skeleton))
-                continue;
-        }
+        if (!cached || !cached->bonesCached) continue;
 
-        Vector3 current;
+        int targetBone = 18;
+        if (!cached->boneValid[targetBone]) continue;
+
         Vector3 currentworld;
-
-
-        Game::GetBonePosition(Skeleton, Game::GeVisualState((uint64_t)curr_entity), 18, &current);
-
-
-        Game::WorldToScreen(current, currentworld);
+        Game::WorldToScreen(cached->bonePositions[targetBone], currentworld);
         auto dx = currentworld.x - (io.DisplaySize.x / 2);
-
         auto dy = currentworld.y - (io.DisplaySize.y / 2);
         auto dist = sqrtf1(dx * dx + dy * dy);
 
@@ -204,6 +196,7 @@ uintptr_t* get_closest_player(std::vector<uintptr_t*> list, float field_of_view)
     return resultant_target_entity_temp;
 }
 
+// Zero-DMA version: uses cached bone positions (single-thread, direct access)
 uintptr_t* get_closest_zombie(std::vector<uintptr_t*> list, float field_of_view)
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -213,23 +206,26 @@ uintptr_t* get_closest_zombie(std::vector<uintptr_t*> list, float field_of_view)
 
     for (auto curr_entity : list)
     {
+        const player_t* cached = nullptr;
+        for (const auto& e : g_entities) {
+            if (e.EntityPtr == (uint64_t)curr_entity) {
+                cached = &e;
+                break;
+            }
+        }
+        if (!cached || !cached->bonesCached) continue;
 
-        uint64_t Skeleton = ReadData<uint64_t>((uint64_t)curr_entity + OFF_ZmSkeleton);
+        // Bone 31 for zombie head... use closest available
+        int targetBone = 31;
+        if (targetBone >= player_t::MAX_BONE_IDX || !cached->boneValid[targetBone]) {
+            // Fallback to bone 8 if 31 not cached
+            targetBone = 8;
+            if (!cached->boneValid[targetBone]) continue;
+        }
 
-
-        if (!Game::IsValidPtr2((void*)Skeleton))
-            continue;
-
-        Vector3 current;
         Vector3 currentworld;
-
-
-        Game::GetBonePosition(Skeleton, Game::GeVisualState((uint64_t)curr_entity), 31, &current);
-
-
-        Game::WorldToScreen(current, currentworld);
+        Game::WorldToScreen(cached->bonePositions[targetBone], currentworld);
         auto dx = currentworld.x - (io.DisplaySize.x / 2);
-
         auto dy = currentworld.y - (io.DisplaySize.y / 2);
         auto dist = sqrtf1(dx * dx + dy * dy);
 
@@ -309,10 +305,12 @@ void DrawLine(float x1, float y1, float x2, float y2, ImColor color)
 }
 
 
-// Scatter-batched skeleton drawing: reads all bone data in 3 scatter passes instead of 4*N individual reads
-void DrawSkeletonScatter(uintptr_t Entity, ImVec4 color, int skeletonType, float lineThickness = 1.5f)
+// Scatter-batched skeleton drawing: uses cached pointer chain, only 1 scatter for bone data
+// Uses pre-cached bone world positions from background thread (0 DMA reads)
+void DrawSkeletonScatter(const player_t& ent, ImVec4 color, int skeletonType, float lineThickness = 1.5f)
 {
-    // Bone pair definitions
+    if (!ent.bonesCached) return;
+
     static int vBonePlayer[][2] = {
         { 21, 61 }, { 61, 63 }, { 63, 65 },
         { 21, 94 }, { 94, 97 }, { 97, 99 },
@@ -331,85 +329,28 @@ void DrawSkeletonScatter(uintptr_t Entity, ImVec4 color, int skeletonType, float
     auto (*vBone)[2] = (skeletonType == 1) ? vBonePlayer : vBoneZombie;
     int pairCount = 15;
 
-    // Collect unique bone indices
-    std::set<int> uniqueBones;
-    for (int i = 0; i < pairCount; ++i) {
-        uniqueBones.insert(vBone[i][0]);
-        uniqueBones.insert(vBone[i][1]);
-    }
-
-    // === Pass 1: Read skeleton pointer chain (skeleton -> animClass -> matrixClass) ===
-    uint64_t skeletonPtr = (skeletonType == 1)
-        ? ReadData<uint64_t>(Entity + OFF_PlayerSkeleton)
-        : ReadData<uint64_t>(Entity + OFF_ZmSkeleton);
-    if (!Game::IsValidPtr2((void*)skeletonPtr)) return;
-
-    uint64_t visualState = ReadData<uint64_t>(Entity + OFF_VisualState);
-    if (!Game::IsValidPtr2((void*)visualState)) return;
-
-    uint64_t animClass = ReadData<uint64_t>(skeletonPtr + OFF_AnimClass);
-    if (!Game::IsValidPtr2((void*)animClass)) return;
-
-    uint64_t matrixClass = ReadData<uint64_t>(animClass + OFF_MatrixClass);
-    if (!Game::IsValidPtr2((void*)matrixClass)) return;
-
-    // === Pass 2: Scatter-read visual matrix + ALL bone vectors at once ===
-    Game::matrix4x4 matrix_a = {};
-    std::map<int, Vector3> boneVectors;
-    std::vector<Vector3> boneStorage(uniqueBones.size());
-
-    {
-        auto s = ScatterBegin();
-        if (!s) return;
-
-        ScatterAdd(s, visualState + 0x8, &matrix_a);
-
-        int idx = 0;
-        for (int boneIdx : uniqueBones) {
-            ScatterAdd(s, matrixClass + OFF_Matrixb + boneIdx * sizeof(Game::matrix4x4), &boneStorage[idx]);
-            idx++;
-        }
-        ScatterExecute(s);
-    }
-
-    // Map bone index -> transformed world position
-    std::map<int, Vector3> worldPositions;
-    {
-        int idx = 0;
-        for (int boneIdx : uniqueBones) {
-            Vector3& mb = boneStorage[idx];
-            Vector3 world;
-            world.x = (matrix_a.m[0] * mb.x) + (matrix_a.m[3] * mb.y) + (matrix_a.m[6] * mb.z) + matrix_a.m[9];
-            world.y = (matrix_a.m[1] * mb.x) + (matrix_a.m[4] * mb.y) + (matrix_a.m[7] * mb.z) + matrix_a.m[10];
-            world.z = (matrix_a.m[2] * mb.x) + (matrix_a.m[5] * mb.y) + (matrix_a.m[8] * mb.z) + matrix_a.m[11];
-            worldPositions[boneIdx] = world;
-            idx++;
-        }
-    }
-
-    // === Draw all bone pairs (no more DMA reads needed) ===
     auto* window = ImGui::GetOverlayDrawList();
     for (int i = 0; i < pairCount; ++i) {
-        auto it1 = worldPositions.find(vBone[i][0]);
-        auto it2 = worldPositions.find(vBone[i][1]);
-        if (it1 == worldPositions.end() || it2 == worldPositions.end()) continue;
+        int b1 = vBone[i][0], b2 = vBone[i][1];
+        if (b1 >= player_t::MAX_BONE_IDX || b2 >= player_t::MAX_BONE_IDX) continue;
+        if (!ent.boneValid[b1] || !ent.boneValid[b2]) continue;
 
         Vector3 s1, s2;
-        if (Game::WorldToScreen(it1->second, s1) && Game::WorldToScreen(it2->second, s2)) {
+        if (Game::WorldToScreen(ent.bonePositions[b1], s1) && Game::WorldToScreen(ent.bonePositions[b2], s2)) {
             window->AddLine(ImVec2(s1.x, s1.y), ImVec2(s2.x, s2.y), ImGui::GetColorU32(color), lineThickness);
         }
     }
 }
 
 // Wrappers matching old signatures
-void DrawSkeleton(uintptr_t Entity, ImVec4 color, int s1)
+void DrawSkeleton(const player_t& ent, ImVec4 color, int s1)
 {
-    DrawSkeletonScatter(Entity, color, 1, 1.5f);
+    DrawSkeletonScatter(ent, color, 1, 1.5f);
 }
 
-void DrawSkeletonZ(uintptr_t Entity, ImVec4 color, int s1)
+void DrawSkeletonZ(const player_t& ent, ImVec4 color, int s1)
 {
-    DrawSkeletonScatter(Entity, color, 2, 1.0f);
+    DrawSkeletonScatter(ent, color, 2, 1.0f);
 }
 
 void DrawBoneIDs(uintptr_t Entity, ImVec4 color, int s1)
@@ -545,46 +486,46 @@ void DrawHealthBar(uintptr_t Entity, const ImVec2& topLeft, const ImVec2& bottom
     window->AddRectFilled(barTopLeft, barBottomRight, ImGui::GetColorU32(healthColor), 100.0f);  // 4.0f é o raio das bordas
 }
 
-void DrawDynamicBox(uintptr_t Entity, ImVec4 color, float lineThickness = 2.0f, float expansionFactor = 1.0f)
+// Uses pre-cached bone world positions (0 DMA reads)
+bool GetBoneScreenBounds(const player_t& ent, const std::vector<int>& boneIndices, ImVec2& topLeft, ImVec2& bottomRight)
 {
-    std::vector<int> boneIndices = { 49, 8, 75, 113, 16, 97, 63, 58, 48 };
+    if (!ent.bonesCached) return false;
+
     std::vector<ImVec2> screenPoints;
+    for (int boneIdx : boneIndices) {
+        if (boneIdx >= player_t::MAX_BONE_IDX || !ent.boneValid[boneIdx]) continue;
 
-    for (int boneIndex : boneIndices)
-    {
-        Vector3 bonePos;
-        if (!Game::GetBonePosition(Game::GetSkeleton(Entity, 1), Game::GeVisualState(Entity), boneIndex, &bonePos))
-            continue;
-
-        Vector3 screenPos3D;
-        if (Game::WorldToScreen(bonePos, screenPos3D))
-        {
-            screenPoints.emplace_back(screenPos3D.x, screenPos3D.y);
-        }
+        Vector3 screenPos;
+        if (Game::WorldToScreen(ent.bonePositions[boneIdx], screenPos))
+            screenPoints.emplace_back(screenPos.x, screenPos.y);
     }
 
-    auto* window = ImGui::GetOverlayDrawList();
+    if (screenPoints.empty()) return false;
 
-    if (screenPoints.empty())
-        return;
-
-    ImVec2 topLeft = screenPoints[0];
-    ImVec2 bottomRight = screenPoints[0];
-
-    for (const auto& point : screenPoints)
-    {
+    topLeft = screenPoints[0];
+    bottomRight = screenPoints[0];
+    for (const auto& point : screenPoints) {
         if (point.x < topLeft.x) topLeft.x = point.x;
         if (point.y < topLeft.y) topLeft.y = point.y;
-
         if (point.x > bottomRight.x) bottomRight.x = point.x;
         if (point.y > bottomRight.y) bottomRight.y = point.y;
     }
+    return true;
+}
+
+void DrawDynamicBox(const player_t& ent, ImVec4 color, float lineThickness = 2.0f, float expansionFactor = 1.0f)
+{
+    static std::vector<int> boneIndices = { 49, 8, 75, 113, 16, 97, 63, 58, 48 };
+    ImVec2 topLeft, bottomRight;
+    if (!GetBoneScreenBounds(ent, boneIndices, topLeft, bottomRight))
+        return;
 
     topLeft.x -= expansionFactor;
     topLeft.y -= expansionFactor;
     bottomRight.x += expansionFactor;
     bottomRight.y += expansionFactor;
 
+    auto* window = ImGui::GetOverlayDrawList();
     ImVec4 outlineColor = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
     float outlineThickness = lineThickness + 2.0f;
     window->AddLine(ImVec2(topLeft.x, topLeft.y), ImVec2(bottomRight.x, topLeft.y), ImGui::GetColorU32(outlineColor), outlineThickness);
@@ -598,83 +539,27 @@ void DrawDynamicBox(uintptr_t Entity, ImVec4 color, float lineThickness = 2.0f, 
     window->AddLine(ImVec2(topLeft.x, bottomRight.y), ImVec2(topLeft.x, topLeft.y), ImGui::GetColorU32(color), lineThickness);
 }
 
-void DrawHealth(uintptr_t Entity, float lineThickness = 2.0f, float expansionFactor = 1.0f)
+void DrawHealth(const player_t& ent, float lineThickness = 2.0f, float expansionFactor = 1.0f)
 {
-    std::vector<int> boneIndices = { 49, 8, 75, 113, 16, 97, 63, 58, 48 };
-    std::vector<ImVec2> screenPoints;
-
-    for (int boneIndex : boneIndices)
-    {
-        Vector3 bonePos;
-        if (!Game::GetBonePosition(Game::GetSkeleton(Entity, 1), Game::GeVisualState(Entity), boneIndex, &bonePos))
-            continue;
-
-        Vector3 screenPos3D;
-        if (Game::WorldToScreen(bonePos, screenPos3D))
-        {
-            screenPoints.emplace_back(screenPos3D.x, screenPos3D.y);
-        }
-    }
-
-    auto* window = ImGui::GetOverlayDrawList();
-
-    if (screenPoints.empty())
+    static std::vector<int> boneIndices = { 49, 8, 75, 113, 16, 97, 63, 58, 48 };
+    ImVec2 topLeft, bottomRight;
+    if (!GetBoneScreenBounds(ent, boneIndices, topLeft, bottomRight))
         return;
-
-    ImVec2 topLeft = screenPoints[0];
-    ImVec2 bottomRight = screenPoints[0];
-
-    for (const auto& point : screenPoints)
-    {
-        if (point.x < topLeft.x) topLeft.x = point.x;
-        if (point.y < topLeft.y) topLeft.y = point.y;
-
-        if (point.x > bottomRight.x) bottomRight.x = point.x;
-        if (point.y > bottomRight.y) bottomRight.y = point.y;
-    }
 
     topLeft.x -= expansionFactor;
     topLeft.y -= expansionFactor;
     bottomRight.x += expansionFactor;
     bottomRight.y += expansionFactor;
 
-    DrawHealthBar(Entity, topLeft, bottomRight);
+    DrawHealthBar(ent.EntityPtr, topLeft, bottomRight);
 }
 
-void DrawCornerBox(uintptr_t Entity, ImVec4 color, float lineThickness = 2.0f, float expansionFactor = 1.0f, float cornerLength = 10.0f)
+void DrawCornerBox(const player_t& ent, ImVec4 color, float lineThickness = 2.0f, float expansionFactor = 1.0f, float cornerLength = 10.0f)
 {
-    std::vector<int> boneIndices = { 49, 8, 75, 113, 16, 97, 63, 58, 48 };
-    std::vector<ImVec2> screenPoints;
-
-    for (int boneIndex : boneIndices)
-    {
-        Vector3 bonePos;
-        if (!Game::GetBonePosition(Game::GetSkeleton(Entity, 1), Game::GeVisualState(Entity), boneIndex, &bonePos))
-            continue;
-
-        Vector3 screenPos3D;
-        if (Game::WorldToScreen(bonePos, screenPos3D))
-        {
-            screenPoints.emplace_back(screenPos3D.x, screenPos3D.y);
-        }
-    }
-
-    auto* window = ImGui::GetOverlayDrawList();
-
-    if (screenPoints.empty())
+    static std::vector<int> boneIndices = { 49, 8, 75, 113, 16, 97, 63, 58, 48 };
+    ImVec2 topLeft, bottomRight;
+    if (!GetBoneScreenBounds(ent, boneIndices, topLeft, bottomRight))
         return;
-
-    ImVec2 topLeft = screenPoints[0];
-    ImVec2 bottomRight = screenPoints[0];
-
-    for (const auto& point : screenPoints)
-    {
-        if (point.x < topLeft.x) topLeft.x = point.x;
-        if (point.y < topLeft.y) topLeft.y = point.y;
-
-        if (point.x > bottomRight.x) bottomRight.x = point.x;
-        if (point.y > bottomRight.y) bottomRight.y = point.y;
-    }
 
     topLeft.x -= expansionFactor;
     topLeft.y -= expansionFactor;
@@ -685,6 +570,7 @@ void DrawCornerBox(uintptr_t Entity, ImVec4 color, float lineThickness = 2.0f, f
     float boxHeight = bottomRight.y - topLeft.y;
     cornerLength = std::min(cornerLength, std::min(boxWidth / 2, boxHeight / 2));
 
+    auto* window = ImGui::GetOverlayDrawList();
     auto drawCorner = [&](ImVec2 start, ImVec2 end) {
         window->AddLine(start, end, ImGui::GetColorU32(color), lineThickness);
         };
@@ -776,12 +662,58 @@ void DrawNameESP(uintptr_t Entity, ImVec4 color)
     window->AddText(ImVec2(screenPos.x, screenPos.y), ImGui::GetColorU32(color), nameText.c_str());
 }
 
-void update_list()
+// Refresh camera + local player between scatter passes so ESP tracks smoothly
+static void RefreshCamera()
 {
-    while (true)
+    Game::UpdateCameraCache();
+    Game::UpdateLocalPlayerCache();
+}
+
+// Single-thread: called inline before each render frame
+void update_entities()
+{
+    // Static state persists across calls (replaces loop-local variables)
+    static int scanCycle = 0;
+    static std::unordered_map<uint64_t, std::pair<std::string, std::string>> cachedPlayerInfo;
+    static std::unordered_map<uint64_t, std::pair<std::string, std::string>> cachedEntityNames;
+
+    struct CachedPtrChain {
+        uint64_t entityTypePtr;
+        uint64_t playerSkeletonPtr, zmSkeletonPtr;
+        uint64_t playerAnimClass, zmAnimClass;
+        uint64_t playerMatrixClass, zmMatrixClass;
+    };
+    static std::unordered_map<uint64_t, CachedPtrChain> cachedPtrChains;
+
+    static LARGE_INTEGER perfFreq = {};
+    if (!perfFreq.QuadPart) QueryPerformanceFrequency(&perfFreq);
+    auto hpc_now = []() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; };
+    double toMs = 1000.0 / perfFreq.QuadPart;
+
     {
+        bool fullScan = (scanCycle % 5 == 0);
+        scanCycle++;
+
+        auto cycleStart = hpc_now();
+        auto passStart = cycleStart;
+
+        // Lambda to measure pass duration
+        struct PassTime { const char* name; double ms; };
+        std::vector<PassTime> passTimes;
+        auto markPass = [&](const char* name) {
+            auto now = hpc_now();
+            passTimes.push_back({ name, (now - passStart) * toMs });
+            passStart = now;
+        };
+
+        // No manual cache refresh — using -norefresh + VMMDLL_FLAG_NOCACHE for all reads.
+        // TLB cache stays warm from init. DayZ page tables don't change during gameplay.
+
         std::vector<player_t> tmp_entities{};
         std::vector<item_t> tmp_items{};
+
+        RefreshCamera(); // camera update at top of every cycle
+        markPass("RefreshCam0");
 
         // === Pass 0: Read table sizes + table pointers in one scatter ===
         uint32_t NearTableSize = 0, FarTableSize = 0, itemTableSize = 0;
@@ -798,6 +730,8 @@ void update_list()
                 ScatterExecute(s);
             }
         }
+
+        markPass("Pass0_Tables");
 
         // Clamp table sizes to sane limits
         if (NearTableSize > 512) NearTableSize = 512;
@@ -823,6 +757,7 @@ void update_list()
                 ScatterExecute(s);
             }
         }
+        markPass("Pass1_EntityPtrs");
 
         // Build entity list from valid pointers
         for (int i = 0; i < totalEntities; ++i) {
@@ -836,18 +771,45 @@ void update_list()
 
         // === Pass 2: Scatter-read core data for all entities ===
         if (!tmp_entities.empty()) {
-            // Read visualState, entityTypePtr, skeletons, isDead, networkID
-            auto s = ScatterBegin();
-            if (s) {
-                for (auto& e : tmp_entities) {
-                    ScatterAdd(s, e.EntityPtr + OFF_VisualState, &e.visualStatePtr);
-                    ScatterAdd(s, e.EntityPtr + OFF_EntityTypePtr, &e.entityTypePtr);
-                    ScatterAdd(s, e.EntityPtr + OFF_PlayerSkeleton, &e.playerSkeletonPtr);
-                    ScatterAdd(s, e.EntityPtr + OFF_ZmSkeleton, &e.zmSkeletonPtr);
-                    ScatterAdd(s, e.EntityPtr + OFF_playerIsDead, &e.isDead);
-                    ScatterAdd(s, e.EntityPtr + OFF_NETWORK, &e.NetworkID);
+            if (fullScan) {
+                // Full scan: read everything including static pointer chains
+                auto s = ScatterBegin();
+                if (s) {
+                    for (auto& e : tmp_entities) {
+                        ScatterAdd(s, e.EntityPtr + OFF_VisualState, &e.visualStatePtr);
+                        ScatterAdd(s, e.EntityPtr + OFF_EntityTypePtr, &e.entityTypePtr);
+                        ScatterAdd(s, e.EntityPtr + OFF_PlayerSkeleton, &e.playerSkeletonPtr);
+                        ScatterAdd(s, e.EntityPtr + OFF_ZmSkeleton, &e.zmSkeletonPtr);
+                        ScatterAdd(s, e.EntityPtr + OFF_playerIsDead, &e.isDead);
+                        ScatterAdd(s, e.EntityPtr + OFF_playerNetworkID, &e.NetworkID);
+                    }
+                    ScatterExecute(s);
                 }
-                ScatterExecute(s);
+            } else {
+                // Fast tick: only read volatile data (visualState, isDead, networkID)
+                // Restore static pointer chains from cache
+                auto s = ScatterBegin();
+                if (s) {
+                    for (auto& e : tmp_entities) {
+                        ScatterAdd(s, e.EntityPtr + OFF_VisualState, &e.visualStatePtr);
+                        ScatterAdd(s, e.EntityPtr + OFF_playerIsDead, &e.isDead);
+                        ScatterAdd(s, e.EntityPtr + OFF_playerNetworkID, &e.NetworkID);
+                    }
+                    ScatterExecute(s);
+                }
+                // Restore cached static pointers
+                for (auto& e : tmp_entities) {
+                    auto it = cachedPtrChains.find(e.EntityPtr);
+                    if (it != cachedPtrChains.end()) {
+                        e.entityTypePtr = it->second.entityTypePtr;
+                        e.playerSkeletonPtr = it->second.playerSkeletonPtr;
+                        e.zmSkeletonPtr = it->second.zmSkeletonPtr;
+                        e.playerAnimClass = it->second.playerAnimClass;
+                        e.zmAnimClass = it->second.zmAnimClass;
+                        e.playerMatrixClass = it->second.playerMatrixClass;
+                        e.zmMatrixClass = it->second.zmMatrixClass;
+                    }
+                }
             }
 
             // === Pass 3: Scatter-read coordinates from visual states ===
@@ -870,67 +832,350 @@ void update_list()
                 tmp_entities[i].dataCached = true;
             }
 
-            // === Pass 4: Scatter-read entity type name + real name pointers ===
-            std::vector<uint64_t> typeNamePtrs(tmp_entities.size(), 0);
-            std::vector<uint64_t> realNamePtrs(tmp_entities.size(), 0);
-            {
-                auto s3 = ScatterBegin();
-                if (s3) {
-                    for (size_t i = 0; i < tmp_entities.size(); ++i) {
-                        if (tmp_entities[i].entityTypePtr) {
-                            ScatterAdd(s3, tmp_entities[i].entityTypePtr + OFF_EntityTypeName, &typeNamePtrs[i]);
-                            ScatterAdd(s3, tmp_entities[i].entityTypePtr + OFF_RealName, &realNamePtrs[i]);
+            if (fullScan) {
+                // === Pass 3b: Scatter-read animClass from skeleton pointers ===
+                {
+                    auto sa = ScatterBegin();
+                    if (sa) {
+                        for (auto& e : tmp_entities) {
+                            if (e.playerSkeletonPtr)
+                                ScatterAdd(sa, e.playerSkeletonPtr + OFF_AnimClass, &e.playerAnimClass);
+                            if (e.zmSkeletonPtr)
+                                ScatterAdd(sa, e.zmSkeletonPtr + OFF_AnimClass, &e.zmAnimClass);
+                        }
+                        ScatterExecute(sa);
+                    }
+                }
+
+                // === Pass 3c: Scatter-read matrixClass from animClass pointers ===
+                {
+                    auto sb = ScatterBegin();
+                    if (sb) {
+                        for (auto& e : tmp_entities) {
+                            if (e.playerAnimClass)
+                                ScatterAdd(sb, e.playerAnimClass + OFF_MatrixClass, &e.playerMatrixClass);
+                            if (e.zmAnimClass)
+                                ScatterAdd(sb, e.zmAnimClass + OFF_MatrixClass, &e.zmMatrixClass);
+                        }
+                        ScatterExecute(sb);
+                    }
+                }
+
+                // Update pointer chain cache
+                cachedPtrChains.clear();
+                for (auto& e : tmp_entities) {
+                    cachedPtrChains[e.EntityPtr] = {
+                        e.entityTypePtr,
+                        e.playerSkeletonPtr, e.zmSkeletonPtr,
+                        e.playerAnimClass, e.zmAnimClass,
+                        e.playerMatrixClass, e.zmMatrixClass
+                    };
+                }
+            }
+            // else: fast tick — static pointers already restored from cache above
+
+            markPass("Pass2-3c_CoreData");
+
+            // === Pass 4+5: Entity type names (full scan only, cached on fast ticks) ===
+            if (fullScan) {
+                std::vector<uint64_t> typeNamePtrs(tmp_entities.size(), 0);
+                std::vector<uint64_t> realNamePtrs(tmp_entities.size(), 0);
+                {
+                    auto s3 = ScatterBegin();
+                    if (s3) {
+                        for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                            if (tmp_entities[i].entityTypePtr) {
+                                ScatterAdd(s3, tmp_entities[i].entityTypePtr + OFF_EntityTypeName, &typeNamePtrs[i]);
+                                ScatterAdd(s3, tmp_entities[i].entityTypePtr + OFF_RealName, &realNamePtrs[i]);
+                            }
+                        }
+                        ScatterExecute(s3);
+                    }
+                }
+                struct NameBuf { char typeName[256]; char realName[256]; };
+                std::vector<NameBuf> nameBufs(tmp_entities.size(), {});
+                {
+                    auto s4 = ScatterBegin();
+                    if (s4) {
+                        for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                            if (typeNamePtrs[i])
+                                ScatterAdd(s4, typeNamePtrs[i] + OFF_TEXT, nameBufs[i].typeName, 256);
+                            if (realNamePtrs[i])
+                                ScatterAdd(s4, realNamePtrs[i] + OFF_TEXT, nameBufs[i].realName, 256);
+                        }
+                        ScatterExecute(s4);
+                    }
+                }
+                cachedEntityNames.clear();
+                for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                    nameBufs[i].typeName[255] = '\0';
+                    nameBufs[i].realName[255] = '\0';
+                    tmp_entities[i].entityTypeName = nameBufs[i].typeName;
+                    tmp_entities[i].entityRealName = nameBufs[i].realName;
+                    if (tmp_entities[i].entityTypePtr)
+                        cachedEntityNames[tmp_entities[i].entityTypePtr] = { tmp_entities[i].entityTypeName, tmp_entities[i].entityRealName };
+                }
+                // (camera refreshed at top of cycle, skip mid-pass DMA)
+            } else {
+                // Fast tick: reuse cached entity names
+                for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                    auto it = cachedEntityNames.find(tmp_entities[i].entityTypePtr);
+                    if (it != cachedEntityNames.end()) {
+                        tmp_entities[i].entityTypeName = it->second.first;
+                        tmp_entities[i].entityRealName = it->second.second;
+                    }
+                }
+            }
+            markPass("Pass4-5_Names");
+
+            // === Pass 6: Cache player names via scatter-based bulk scoreboard lookup ===
+            if (fullScan) {
+                cachedPlayerInfo.clear();
+
+                // 6a: Read network client + scoreboard pointer + size (1 scatter)
+                uint64_t network_client = 0;
+                uint64_t scoreboard = 0;
+                uint32_t scoreboard_size = 0;
+                {
+                    auto s = ScatterBegin();
+                    if (s) {
+                        ScatterAdd(s, globals.Base + OFF_Network_Manager + OFF_Network_Client, &network_client);
+                        ScatterExecute(s);
+                    }
+                }
+                if (Game::IsValidPtr2((void*)network_client)) {
+                    auto s = ScatterBegin();
+                    if (s) {
+                        ScatterAdd(s, network_client + OFF_Network_Table, &scoreboard);
+                        ScatterAdd(s, network_client + OFF_Network_Table_Size, &scoreboard_size);
+                        ScatterExecute(s);
+                    }
+                }
+
+                // 6b: Read ALL scoreboard identity pointers in one scatter
+                if (scoreboard_size > 0 && scoreboard_size <= 120 && Game::IsValidPtr2((void*)scoreboard)) {
+                    std::vector<uint64_t> identityPtrs(scoreboard_size, 0);
+                    {
+                        auto s = ScatterBegin();
+                        if (s) {
+                            for (uint32_t i = 0; i < scoreboard_size; i++)
+                                ScatterAdd(s, scoreboard + (i * sizeof(uint64_t)), &identityPtrs[i]);
+                            ScatterExecute(s);
                         }
                     }
-                    ScatterExecute(s3);
-                }
-            }
 
-            // === Pass 5: Scatter-read the actual name strings ===
-            struct NameBuf { char typeName[256]; char realName[256]; };
-            std::vector<NameBuf> nameBufs(tmp_entities.size(), {});
-            {
-                auto s4 = ScatterBegin();
-                if (s4) {
-                    for (size_t i = 0; i < tmp_entities.size(); ++i) {
-                        if (typeNamePtrs[i])
-                            ScatterAdd(s4, typeNamePtrs[i] + OFF_TEXT, nameBufs[i].typeName, 256);
-                        if (realNamePtrs[i])
-                            ScatterAdd(s4, realNamePtrs[i] + OFF_TEXT, nameBufs[i].realName, 256);
+                    // 6c: Read ALL identity IDs + name pointers in one scatter
+                    std::vector<uint32_t> identityIDs(scoreboard_size, 0);
+                    std::vector<uint64_t> identityNamePtrs(scoreboard_size, 0);
+                    {
+                        auto s = ScatterBegin();
+                        if (s) {
+                            for (uint32_t i = 0; i < scoreboard_size; i++) {
+                                if (Game::IsValidPtr2((void*)identityPtrs[i])) {
+                                    ScatterAdd(s, identityPtrs[i] + OFF_Network_Table_ID, &identityIDs[i]);
+                                    ScatterAdd(s, identityPtrs[i] + OFF_PlayerName, &identityNamePtrs[i]);
+                                }
+                            }
+                            ScatterExecute(s);
+                        }
                     }
-                    ScatterExecute(s4);
-                }
-            }
-            for (size_t i = 0; i < tmp_entities.size(); ++i) {
-                nameBufs[i].typeName[255] = '\0';
-                nameBufs[i].realName[255] = '\0';
-                tmp_entities[i].entityTypeName = nameBufs[i].typeName;
-                tmp_entities[i].entityRealName = nameBufs[i].realName;
-            }
+                    // (camera refreshed at top of cycle, skip mid-pass DMA)
 
-            // === Pass 6: Cache player names for "dayzplayer" entities ===
-            // Uses get_player_name which does its own DMA reads, but only for actual players (not zombies/animals)
-            // This moves the cost from every-frame to every-250ms
-            {
-                int playerCount = 0;
+                    // 6d: Read ALL name strings in one scatter
+                    struct NameStr { char buf[64]; };
+                    std::vector<NameStr> nameStrings(scoreboard_size, {});
+                    {
+                        auto s = ScatterBegin();
+                        if (s) {
+                            for (uint32_t i = 0; i < scoreboard_size; i++) {
+                                if (identityNamePtrs[i])
+                                    ScatterAdd(s, identityNamePtrs[i] + OFF_TEXT, nameStrings[i].buf, 64);
+                            }
+                            ScatterExecute(s);
+                        }
+                    }
+
+                    // Build ID → name map (0 DMA, local lookup)
+                    std::unordered_map<uint32_t, std::string> idToName;
+                    for (uint32_t i = 0; i < scoreboard_size; i++) {
+                        if (identityIDs[i] > 0) {
+                            nameStrings[i].buf[63] = '\0';
+                            idToName[identityIDs[i]] = nameStrings[i].buf;
+                        }
+                    }
+
+                    // Assign names to entities using cached NetworkID from Pass 2
+                    for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                        if (tmp_entities[i].entityTypeName != "dayzplayer") {
+                            tmp_entities[i].playerName = "";
+                            continue;
+                        }
+                        auto nameIt = idToName.find((uint32_t)tmp_entities[i].NetworkID);
+                        if (nameIt != idToName.end())
+                            tmp_entities[i].playerName = nameIt->second;
+                        else
+                            tmp_entities[i].playerName = "BOT";
+
+                        cachedPlayerInfo[tmp_entities[i].EntityPtr] = { tmp_entities[i].playerName, tmp_entities[i].itemInHands };
+                    }
+                }
+
+                // 6e: Batch item-in-hands reads for players (scatter-based)
+                // Step 1: read inventory pointers
+                std::vector<size_t> playerIndices;
+                std::vector<uint64_t> inventoryPtrs;
+                for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                    if (tmp_entities[i].entityTypeName == "dayzplayer") {
+                        playerIndices.push_back(i);
+                        inventoryPtrs.push_back(0);
+                    }
+                }
+                if (!playerIndices.empty()) {
+                    auto s = ScatterBegin();
+                    if (s) {
+                        for (size_t j = 0; j < playerIndices.size(); j++)
+                            ScatterAdd(s, tmp_entities[playerIndices[j]].EntityPtr + OFF_Inventory, &inventoryPtrs[j]);
+                        ScatterExecute(s);
+                    }
+                    // Step 2: read inhands pointers
+                    std::vector<uint64_t> inhandsPtrs(playerIndices.size(), 0);
+                    {
+                        auto s2 = ScatterBegin();
+                        if (s2) {
+                            for (size_t j = 0; j < playerIndices.size(); j++) {
+                                if (inventoryPtrs[j])
+                                    ScatterAdd(s2, inventoryPtrs[j] + OFF_Inhands, &inhandsPtrs[j]);
+                            }
+                            ScatterExecute(s2);
+                        }
+                    }
+                    // Step 3: read entity type pointers from inhands
+                    std::vector<uint64_t> inhandsTypePtrs(playerIndices.size(), 0);
+                    {
+                        auto s3 = ScatterBegin();
+                        if (s3) {
+                            for (size_t j = 0; j < playerIndices.size(); j++) {
+                                if (inhandsPtrs[j])
+                                    ScatterAdd(s3, inhandsPtrs[j] + OFF_EntityTypePtr, &inhandsTypePtrs[j]);
+                            }
+                            ScatterExecute(s3);
+                        }
+                    }
+                    // Step 4: read clean name pointers
+                    std::vector<uint64_t> cleanNamePtrs(playerIndices.size(), 0);
+                    {
+                        auto s4 = ScatterBegin();
+                        if (s4) {
+                            for (size_t j = 0; j < playerIndices.size(); j++) {
+                                if (inhandsTypePtrs[j])
+                                    ScatterAdd(s4, inhandsTypePtrs[j] + OFF_CleanName, &cleanNamePtrs[j]);
+                            }
+                            ScatterExecute(s4);
+                        }
+                    }
+                    // Step 5: read the actual item name strings
+                    struct ItemNameBuf { char buf[128]; };
+                    std::vector<ItemNameBuf> itemNames(playerIndices.size(), {});
+                    {
+                        auto s5 = ScatterBegin();
+                        if (s5) {
+                            for (size_t j = 0; j < playerIndices.size(); j++) {
+                                if (cleanNamePtrs[j])
+                                    ScatterAdd(s5, cleanNamePtrs[j] + OFF_TEXT, itemNames[j].buf, 128);
+                            }
+                            ScatterExecute(s5);
+                        }
+                    }
+                    for (size_t j = 0; j < playerIndices.size(); j++) {
+                        itemNames[j].buf[127] = '\0';
+                        tmp_entities[playerIndices[j]].itemInHands = itemNames[j].buf;
+                        cachedPlayerInfo[tmp_entities[playerIndices[j]].EntityPtr].second = itemNames[j].buf;
+                    }
+                }
+            } else {
+                // Fast tick: reuse cached names from last full scan
                 for (size_t i = 0; i < tmp_entities.size(); ++i) {
                     if (tmp_entities[i].entityTypeName != "dayzplayer") {
                         tmp_entities[i].playerName = "";
                         continue;
                     }
-                    // Cap to avoid excessive DMA in dense areas
-                    if (playerCount >= 60) {
-                        tmp_entities[i].playerName = "BOT";
-                        continue;
+                    auto it = cachedPlayerInfo.find(tmp_entities[i].EntityPtr);
+                    if (it != cachedPlayerInfo.end()) {
+                        tmp_entities[i].playerName = it->second.first;
+                        tmp_entities[i].itemInHands = it->second.second;
                     }
-                    tmp_entities[i].playerName = get_player_name(tmp_entities[i].EntityPtr);
-                    playerCount++;
                 }
             }
         }
+            markPass(fullScan ? "Pass6_FullScan" : "Pass6_FastTick");
 
-        // === Scatter-read item pointers ===
-        if (itemTableSize > 0 && ItemTablePtr) {
+            // === Pass 7: Cache bone world positions for all entities ===
+            {
+                // All bone indices needed by skeleton + box + health draws
+                static const int playerBones[] = { 1, 4, 6, 7, 8, 9, 11, 14, 15, 16, 18, 21, 48, 49, 58, 61, 63, 65, 75, 94, 97, 99, 113 };
+                static const int zombieBones[] = { 0, 1, 3, 6, 7, 8, 10, 13, 14, 19, 24, 27, 53, 56, 59, 60 };
+                static const int playerBoneCount = sizeof(playerBones) / sizeof(playerBones[0]);
+                static const int zombieBoneCount = sizeof(zombieBones) / sizeof(zombieBones[0]);
+
+                // Read matrix_a for all entities in one scatter
+                std::vector<Game::matrix4x4> matrixAs(tmp_entities.size(), {});
+                {
+                    auto s = ScatterBegin();
+                    if (s) {
+                        for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                            if (tmp_entities[i].visualStatePtr)
+                                ScatterAdd(s, tmp_entities[i].visualStatePtr + 0x8, &matrixAs[i]);
+                        }
+                        ScatterExecute(s);
+                    }
+                }
+
+                // Read bone vectors for all entities in one scatter
+                struct BoneRead { size_t entityIdx; int boneIdx; Vector3 vec; };
+                std::vector<BoneRead> boneReads;
+                boneReads.reserve(tmp_entities.size() * playerBoneCount);
+
+                {
+                    auto s = ScatterBegin();
+                    if (s) {
+                        for (size_t i = 0; i < tmp_entities.size(); ++i) {
+                            auto& e = tmp_entities[i];
+                            bool isPlayer = (e.entityTypeName == "dayzplayer");
+                            uint64_t mc = isPlayer ? e.playerMatrixClass : e.zmMatrixClass;
+                            if (!Game::IsValidPtr2((void*)mc)) continue;
+
+                            const int* bones = isPlayer ? playerBones : zombieBones;
+                            int count = isPlayer ? playerBoneCount : zombieBoneCount;
+
+                            for (int b = 0; b < count; ++b) {
+                                BoneRead br = { i, bones[b], {} };
+                                boneReads.push_back(br);
+                                ScatterAdd(s, mc + OFF_Matrixb + bones[b] * sizeof(Game::matrix4x4), &boneReads.back().vec);
+                            }
+                        }
+                        ScatterExecute(s);
+                    }
+                }
+
+                // Compute world positions from matrix_a * bone vectors
+                for (auto& br : boneReads) {
+                    auto& ma = matrixAs[br.entityIdx];
+                    auto& mb = br.vec;
+                    Vector3 world;
+                    world.x = (ma.m[0] * mb.x) + (ma.m[3] * mb.y) + (ma.m[6] * mb.z) + ma.m[9];
+                    world.y = (ma.m[1] * mb.x) + (ma.m[4] * mb.y) + (ma.m[7] * mb.z) + ma.m[10];
+                    world.z = (ma.m[2] * mb.x) + (ma.m[5] * mb.y) + (ma.m[8] * mb.z) + ma.m[11];
+                    if (br.boneIdx < player_t::MAX_BONE_IDX) {
+                        tmp_entities[br.entityIdx].bonePositions[br.boneIdx] = world;
+                        tmp_entities[br.entityIdx].boneValid[br.boneIdx] = true;
+                        tmp_entities[br.entityIdx].bonesCached = true;
+                    }
+                }
+            }
+            markPass("Pass7_Bones");
+
+        // === Scatter-read item pointers (only on full scan) ===
+        if (fullScan && itemTableSize > 0 && ItemTablePtr) {
             std::vector<uint64_t> itemPtrs(itemTableSize, 0);
             auto s = ScatterBegin();
             if (s) {
@@ -947,16 +1192,31 @@ void update_list()
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(entitiesMutex);
-            entities = std::move(tmp_entities);
-        }
-        {
-            std::lock_guard<std::mutex> lock(itemsMutex);
+        // Single-thread: direct assignment, no mutex needed
+        g_entities = std::move(tmp_entities);
+        if (fullScan) {
             items = std::move(tmp_items);
         }
+        markPass("Snapshot");
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        // Update item cache only on full scan
+        if (fullScan) {
+            UpdateItemCache(globals.World);
+            markPass("UpdateItemCache");
+        }
+
+        // Log timing — always log full scans, slow cycles, and every 10th cycle
+        double totalCycleMs = (hpc_now() - cycleStart) * toMs;
+        bool isSlow = totalCycleMs > 50.0;
+        if (isSlow || fullScan || scanCycle % 10 == 0) {
+            std::string prefix = isSlow ? "[ !!! STUTTER cycle " : (fullScan ? "[ FULL cycle " : "[ BG cycle ");
+            std::string timingLog = prefix + std::to_string(scanCycle) + " ] TOTAL=" + std::to_string((int)totalCycleMs) + "ms | entities=" + std::to_string((int)g_entities.size()) + " | ";
+            for (auto& pt : passTimes) {
+                timingLog += std::string(pt.name) + "=" + std::to_string((int)pt.ms) + " ";
+            }
+            Log(timingLog);
+        }
+
     }
 }
 
@@ -1218,92 +1478,43 @@ inline void __stdcall main_aimboo2()
         if (!GameVars.resultant_target_entity)
             return;
 
-        Vector3 worldPosition = Game::GetCoordinate((uint64_t)GameVars.resultant_target_entity);
-
-        int dist = Game::GetDistanceToMe(worldPosition);
-
-        //	if (dist > LimiteDoSilent) {
-                //resultant_target_entity = nullptr;
-                //return;
-            //}
-        Vector3 currentworld;
-
-        Game::WorldToScreen(worldPosition, currentworld);
-
-        //window->AddLine(ImVec2{ (float)io.DisplaySize.x / 2, (float)io.DisplaySize.y }, ImVec2{ currentworld.x, currentworld.y }, ImGui::ColorConvertFloat4ToU32(ImVec4(255, 255, 0, 255)), 1.5f);
-
+        // SilentAim needs to do its own DMA write — that's the actual aimbot action
         SilentAim1((uintptr_t)GameVars.resultant_target_entity);
     }
 }
 
+// Zero-DMA inventory view: uses cached player name + item-in-hands from background thread
 void inventoryPlayers() {
     ImGuiIO& io = ImGui::GetIO();
 
-    if (GameVars.inventory) {
-        uint64_t ff = (uint64_t)get_closest_player(valid_players4inventory, GameVars.invfov);
-        if (!ff)
-            return;
+    if (!GameVars.inventory) return;
 
-        uint64_t Skeleton = ReadData<uint64_t>(ff + OFF_PlayerSkeleton);
-        if (!Game::IsValidPtr2((void*)Skeleton))
-            return;
+    uint64_t ff = (uint64_t)get_closest_player(valid_players4inventory, GameVars.invfov);
+    if (!ff) return;
 
-        Vector3 current;
-        Vector3 currentworld;
-
-        Game::GetBonePosition(Skeleton, Game::GeVisualState((uint64_t)ff), 24, &current);
-        Game::WorldToScreen(current, currentworld);
-        {
-            auto Inventory = Game::GetInventory(ff);
-            if (!Inventory)
-                return;
-
-            auto equiped = ReadData<uint64_t>(Inventory + OFF_InventoryP);
-            if (!equiped)
-                return;
-
-            auto size = ReadData<uint32_t>(Inventory + OFF_InventoryPsize);
-            if (!size)
-                return;
-
-            std::vector<std::string> item_names1;
-            std::string  objectBase;
-            for (size_t i = 0; i < size; i++)
-            {
-                auto item = ReadData<uintptr_t>(equiped + i * 0x10 + 0x8);
-                if (!item)
-                    continue;
-
-                objectBase = Game::GetEntityTypeName(item);
-                if (objectBase.empty())
-                    continue;
-
-                uintptr_t objectBase1 = ReadData<uintptr_t>(item + OFF_ObjectBase);
-
-                uintptr_t cleanNamePtr2 = ReadData<uintptr_t>(objectBase1 + OFF_CleanName2);
-
-                if (!Game::IsValidPtr2((void*)cleanNamePtr2))
-                    continue;
-
-                uintptr_t cleanNamePtr = ReadData<uintptr_t>(objectBase1 + OFF_CleanName);
-                if (!Game::IsValidPtr2((void*)cleanNamePtr))
-                    continue;
-
-                std::string text = Game::getNameFromId(cleanNamePtr);
-                item_names1.push_back(text);
-            }
-
-            if (item_names1.empty())
-                return;
-
-            if (objectBase.empty())
-                return;
-
-            DrawInventoryList(item_names1, get_player_name(ff), { (float)io.DisplaySize.x, (float)io.DisplaySize.y }, { 19.f, 19.f, 19.f, 255.f });
+    // Find this entity in cached data (single-thread, direct access)
+    const player_t* cached = nullptr;
+    for (const auto& e : g_entities) {
+        if (e.EntityPtr == (uint64_t)ff) {
+            cached = &e;
+            break;
         }
-
     }
-    return;
+    if (!cached || !cached->bonesCached) return;
+
+    // Use cached bone 24 position
+    if (!cached->boneValid[24]) return;
+    Vector3 currentworld;
+    Game::WorldToScreen(cached->bonePositions[24], currentworld);
+
+    // Show player name + item in hands from cached data
+    std::vector<std::string> item_names1;
+    if (!cached->itemInHands.empty())
+        item_names1.push_back(cached->itemInHands);
+
+    if (item_names1.empty()) return;
+
+    DrawInventoryList(item_names1, cached->playerName, { (float)io.DisplaySize.x, (float)io.DisplaySize.y }, { 19.f, 19.f, 19.f, 255.f });
 }
 
 uintptr_t* get_closest_Item1(std::vector<uintptr_t*> list, float field_of_view)
@@ -1371,13 +1582,21 @@ struct CachedItemData {
     int quality;
 };
 static std::vector<CachedItemData> cachedItemsForDraw;
-static std::mutex cachedItemsMutex;
 
 // Fetch item data via DMA (called on a throttled timer)
 void UpdateItemCache(uintptr_t pUWorld)
 {
-    int objectTableSz = ReadData<int>(pUWorld + OFF_ItemTable + 0x8);
-    uintptr_t entityTable = ReadData<uintptr_t>(pUWorld + OFF_ItemTable);
+    // Read item table pointer + size in one scatter (avoid sequential DMA)
+    int objectTableSz = 0;
+    uintptr_t entityTable = 0;
+    {
+        auto s = ScatterBegin();
+        if (s) {
+            ScatterAdd(s, pUWorld + OFF_ItemTable + 0x8, &objectTableSz);
+            ScatterAdd(s, pUWorld + OFF_ItemTable, &entityTable);
+            ScatterExecute(s);
+        }
+    }
     if (!Game::IsValidPtr2((void*)entityTable) || objectTableSz <= 0 || objectTableSz > 2048)
         return;
 
@@ -1406,7 +1625,6 @@ void UpdateItemCache(uintptr_t pUWorld)
     }
 
     if (validItems.empty()) {
-        std::lock_guard<std::mutex> lock(cachedItemsMutex);
         cachedItemsForDraw.clear();
         return;
     }
@@ -1449,41 +1667,72 @@ void UpdateItemCache(uintptr_t pUWorld)
         }
     }
 
-    // Build cached item list with resolved names
+    // === Scatter Pass 4: Bulk-read all item name strings (replaces sequential getNameFromId) ===
+    // Each item has 3 name pointers. Read name data (up to 256 bytes) from each in one scatter.
+    struct ItemNameData { char buf[256]; };
+    std::vector<ItemNameData> nameData1(validItems.size(), {}); // from cleanNamePtr
+    std::vector<ItemNameData> nameData2(validItems.size(), {}); // from cleanName2Ptr
+    std::vector<ItemNameData> nameData3(validItems.size(), {}); // from cleanName5Ptr
+    {
+        auto s = ScatterBegin();
+        if (s) {
+            for (size_t i = 0; i < validItems.size(); i++) {
+                if (Game::IsValidPtr2((void*)cleanNamePtrs[i]))
+                    ScatterAdd(s, cleanNamePtrs[i] + OFF_TEXT, nameData1[i].buf, 256);
+                if (Game::IsValidPtr2((void*)cleanName2Ptrs[i]))
+                    ScatterAdd(s, cleanName2Ptrs[i] + OFF_TEXT, nameData2[i].buf, 256);
+                if (Game::IsValidPtr2((void*)cleanName5Ptrs[i]))
+                    ScatterAdd(s, cleanName5Ptrs[i] + OFF_TEXT, nameData3[i].buf, 256);
+            }
+            ScatterExecute(s);
+        }
+    }
+
+    // Build cached item list from scatter results (0 DMA)
     std::vector<CachedItemData> newCache;
     newCache.reserve(validItems.size());
 
     for (size_t i = 0; i < validItems.size(); i++)
     {
-        uintptr_t cleanNamePtr = cleanNamePtrs[i];
-        uintptr_t cleanNamePtr2 = cleanName2Ptrs[i];
-        uintptr_t cleanNamePtr5 = cleanName5Ptrs[i];
+        // Skip items with no valid visual state (would have 0,0,0 coordinates)
+        if (!visualStatePtrs[i]) continue;
+        if (itemCoords[i].x == 0.0f && itemCoords[i].y == 0.0f && itemCoords[i].z == 0.0f) continue;
 
-        if (!Game::IsValidPtr2((void*)cleanNamePtr)) continue;
-        if (!Game::IsValidPtr2((void*)cleanNamePtr5)) continue;
-        if (!Game::IsValidPtr2((void*)cleanNamePtr2)) continue;
+        if (!Game::IsValidPtr2((void*)cleanNamePtrs[i])) continue;
+        if (!Game::IsValidPtr2((void*)cleanName5Ptrs[i])) continue;
+        if (!Game::IsValidPtr2((void*)cleanName2Ptrs[i])) continue;
 
-        std::string text = Game::getNameFromId(cleanNamePtr);
-        std::string text2 = Game::getNameFromId(cleanNamePtr2);
-        std::string text3 = Game::getNameFromId(cleanNamePtr5);
+        nameData1[i].buf[255] = '\0';
+        nameData2[i].buf[255] = '\0';
+        nameData3[i].buf[255] = '\0';
 
-        if (text2.empty() || std::all_of(text2.begin(), text2.end(), isspace)) continue;
-        if (text3.empty() || std::all_of(text3.begin(), text3.end(), isspace)) continue;
+        std::string text(nameData1[i].buf);
+        std::string text2(nameData2[i].buf);
+        std::string text3(nameData3[i].buf);
+
+        // Filter out unwanted entity types (same logic as getNameFromId)
+        if (text.find("Animal") != std::string::npos || text.find("Zmb") != std::string::npos ||
+            text.find("Firewood") != std::string::npos || text.find("Barrel") != std::string::npos ||
+            text.find("Watchtower") != std::string::npos || text.find("Wood Pillar") != std::string::npos ||
+            text.find("Roof") != std::string::npos || text.find("Wall") != std::string::npos ||
+            text.find("Floor") != std::string::npos || text.find("Fireplace") != std::string::npos ||
+            text.find("Wire Mesh Barrier") != std::string::npos || text.find("Fence") != std::string::npos)
+            continue;
+
+        if (text2.empty() || std::all_of(text2.begin(), text2.end(), [](unsigned char c){ return std::isspace(c); })) continue;
+        if (text3.empty() || std::all_of(text3.begin(), text3.end(), [](unsigned char c){ return std::isspace(c); })) continue;
 
         CachedItemData item;
         item.entity = validItems[i].entity;
         item.worldPos = Vector3(itemCoords[i].x, itemCoords[i].y, itemCoords[i].z);
-        item.text = text;
-        item.text2 = text2;
-        item.text3 = text3;
+        item.text = std::move(text);
+        item.text2 = std::move(text2);
+        item.text3 = std::move(text3);
         item.quality = itemQualities[i];
         newCache.push_back(std::move(item));
     }
 
-    {
-        std::lock_guard<std::mutex> lock(cachedItemsMutex);
-        cachedItemsForDraw = std::move(newCache);
-    }
+    cachedItemsForDraw = std::move(newCache);
 }
 
 // Draw items from cache (called every frame, no DMA)
@@ -1491,11 +1740,8 @@ void DrawCachedItems()
 {
     auto* window = ImGui::GetOverlayDrawList();
 
-    std::vector<CachedItemData> localCache;
-    {
-        std::lock_guard<std::mutex> lock(cachedItemsMutex);
-        localCache = cachedItemsForDraw;
-    }
+    // Single-thread: read directly, no copy needed
+    const auto& localCache = cachedItemsForDraw;
 
     float spacing = 20.0f;
     std::map<std::pair<int, int>, bool> textPositionsitems;
@@ -1778,14 +2024,41 @@ void DrawCorpses() {
             std::pow(screenPosition.y - io.DisplaySize.y / 2, 2)
         );
 
+        // Build temporary player_t with cached pointer chain for corpse draws
+        player_t corpseEnt = {};
+        corpseEnt.EntityPtr = corpse;
+        corpseEnt.visualStatePtr = ReadData<uint64_t>(corpse + OFF_VisualState);
+        corpseEnt.playerSkeletonPtr = ReadData<uint64_t>(corpse + OFF_PlayerSkeleton);
+        if (corpseEnt.playerSkeletonPtr) {
+            corpseEnt.playerAnimClass = ReadData<uint64_t>(corpseEnt.playerSkeletonPtr + OFF_AnimClass);
+            if (corpseEnt.playerAnimClass)
+                corpseEnt.playerMatrixClass = ReadData<uint64_t>(corpseEnt.playerAnimClass + OFF_MatrixClass);
+        }
+
+        // Compute bone world positions for corpse (DMA but capped at 20 corpses)
+        if (corpseEnt.visualStatePtr && corpseEnt.playerMatrixClass) {
+            static const int corpseBones[] = { 1, 4, 6, 7, 8, 9, 11, 14, 15, 16, 18, 21, 48, 49, 58, 61, 63, 65, 75, 94, 97, 99, 113 };
+            Game::matrix4x4 ma = ReadData<Game::matrix4x4>(corpseEnt.visualStatePtr + 0x8);
+            for (int b : corpseBones) {
+                Vector3 mb = ReadData<Vector3>(corpseEnt.playerMatrixClass + OFF_Matrixb + b * sizeof(Game::matrix4x4));
+                Vector3 world;
+                world.x = (ma.m[0] * mb.x) + (ma.m[3] * mb.y) + (ma.m[6] * mb.z) + ma.m[9];
+                world.y = (ma.m[1] * mb.x) + (ma.m[4] * mb.y) + (ma.m[7] * mb.z) + ma.m[10];
+                world.z = (ma.m[2] * mb.x) + (ma.m[5] * mb.y) + (ma.m[8] * mb.z) + ma.m[11];
+                corpseEnt.bonePositions[b] = world;
+                corpseEnt.boneValid[b] = true;
+            }
+            corpseEnt.bonesCached = true;
+        }
+
         if (GameVars.skeletonESP) {
             ImVec4 skeletonColorVec4 = ImVec4(0, 0, 0, 255);
-            DrawSkeleton(corpse, skeletonColorVec4, 1);
+            DrawSkeleton(corpseEnt, skeletonColorVec4, 1);
         }
 
         if (GameVars.boxESP) {
             ImVec4 boxColorVec4 = ImVec4(0, 0, 0, 255);
-            DrawDynamicBox(corpse, boxColorVec4);
+            DrawDynamicBox(corpseEnt, boxColorVec4);
         }
 
         if (GameVars.CorpseTeleport) {
@@ -1808,25 +2081,35 @@ void DrawCorpses() {
 
 void draw_esp()
 {
-    // Update per-frame caches (1 scatter read for camera, 2 reads for local player)
-    Game::UpdateCameraCache();
-    Game::UpdateLocalPlayerCache();
+    // === Frame timing profiler — logs any section taking >50ms ===
+    static LARGE_INTEGER perfFreq = {};
+    if (!perfFreq.QuadPart) QueryPerformanceFrequency(&perfFreq);
+    auto now_hpc = []() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; };
+    double toMs = 1000.0 / perfFreq.QuadPart;
 
-    DrawCorpses();
+    auto frameStart = now_hpc();
+    auto sectionStart = frameStart;
 
-    // Throttle item data fetch (heavy DMA) but draw cached items every frame
-    {
-        static DWORD lastItemTick = 0;
-        DWORD now = GetTickCount();
-        if (now - lastItemTick >= 500) {
-            lastItemTick = now;
-            UpdateItemCache(globals.World);
+    auto checkSection = [&](const char* name) {
+        auto elapsed = now_hpc() - sectionStart;
+        double ms = elapsed * toMs;
+        if (ms > 16.0) {
+            Log("[ PERF ] " + std::string(name) + " took " + std::to_string((int)ms) + "ms");
         }
+        sectionStart = now_hpc();
+    };
+
+    // Single-thread: update all entity data inline before rendering
+    update_entities();
+    checkSection("UpdateEntities");
+
+    if (GameVars.itemsESP) {
+        DrawCachedItems();
     }
-    DrawCachedItems();
+    checkSection("DrawCachedItems");
     uint64_t localPlayer = Game::cachedLocalPlayer;
 
-    for (auto Entities : entities)
+    for (const auto& Entities : g_entities)
     {
         if (!GameVars.inlocal) {
             if (Entities.EntityPtr == localPlayer)
@@ -1834,12 +2117,8 @@ void draw_esp()
         }
 
         // Use cached data from update_list scatter reads (0 DMA reads here)
-        Vector3 worldPosition;
-        if (Entities.dataCached) {
-            worldPosition = Vector3(Entities.coordX, Entities.coordY, Entities.coordZ);
-        } else {
-            worldPosition = Game::GetCoordinate(Entities.EntityPtr);
-        }
+        if (!Entities.dataCached) continue; // Skip uncached entities — never do DMA on render thread
+        Vector3 worldPosition(Entities.coordX, Entities.coordY, Entities.coordZ);
         Vector3 screenPosition;
 
         if (!Game::WorldToScreen(worldPosition, screenPosition))
@@ -1848,8 +2127,8 @@ void draw_esp()
         int distance = Game::GetDistanceToMe(worldPosition);
 
         // Use cached entity names (0 DMA reads here)
-        std::string entity = Entities.dataCached ? Entities.entityTypeName : Game::GetEntityTypeName(Entities.EntityPtr);
-        std::string entityRealName = Entities.dataCached ? Entities.entityRealName : Game::GetEntityRealName(Entities.EntityPtr);
+        const std::string& entity = Entities.entityTypeName;
+        const std::string& entityRealName = Entities.entityRealName;
 
         valid_players.push_back((uintptr_t*)Entities.EntityPtr);
 
@@ -1858,7 +2137,7 @@ void draw_esp()
         }
 
         // Use cached player name from update_list (0 DMA reads)
-        std::string playerName = Entities.dataCached ? Entities.playerName : Game::GetPlayerName(Entities.EntityPtr);
+        const std::string& playerName = Entities.playerName;
         std::string playerNameList = playerName;
 
         if (GameVars.playerlistm) {
@@ -1870,10 +2149,29 @@ void draw_esp()
         //DrawStringWithBackGround(globals.Width / 2, globals.Height / 2 - 500, &Col.glassblack, color, Game::GetNetworkClientServerName().c_str());
         //DrawStringWithBackGround(globals.Width / 2, globals.Height / 2 - 500, &Col.glassblack, color, Game::GetPlayerCountString().c_str());
 
-        bool entityIsDead = Entities.dataCached ? (Entities.isDead == 1) : Game::is_dead(Entities.EntityPtr);
-        UpdateCorpses(Entities.EntityPtr, entityIsDead);
+        bool entityIsDead = (Entities.isDead == 1);
 
-        if (entityIsDead && std::find(corpses.begin(), corpses.end(), Entities.EntityPtr) != corpses.end()) {
+        // Dead entities: draw corpse skeleton/box using cached data (0 DMA), then skip normal ESP
+        if (entityIsDead) {
+            if (GameVars.deadESP && entity == xorstr_("dayzplayer") && Entities.bonesCached) {
+                if (GameVars.skeletonESP) {
+                    ImVec4 corpseColor = ImVec4(0, 0, 0, 255);
+                    DrawSkeleton(Entities, corpseColor, 1);
+                }
+                if (GameVars.boxESP) {
+                    ImVec4 corpseBoxColor = ImVec4(0, 0, 0, 255);
+                    DrawDynamicBox(Entities, corpseBoxColor);
+                }
+                if (GameVars.CorpseTeleport) {
+                    ImGuiIO& tpIo = ImGui::GetIO();
+                    float dx = screenPosition.x - tpIo.DisplaySize.x / 2;
+                    float dy = screenPosition.y - tpIo.DisplaySize.y / 2;
+                    float distToCenter = std::sqrt(dx * dx + dy * dy);
+                    if (distToCenter <= GameVars.tpfov && GetAsyncKeyState(GameVars.lootTPHotkey)) {
+                        PushLootTP(Entities.EntityPtr, localPlayer);
+                    }
+                }
+            }
             continue;
         }
 
@@ -1884,30 +2182,30 @@ void draw_esp()
             if (!isFriend) {
                 if (GameVars.skeletonESP) {
                     ImVec4 skeletonColorVec4 = ImVec4(GameVars.skeletonColorArray[0], GameVars.skeletonColorArray[1], GameVars.skeletonColorArray[2], GameVars.skeletonColorArray[3]);
-                    DrawSkeleton(Entities.EntityPtr, skeletonColorVec4, 1);
+                    DrawSkeleton(Entities, skeletonColorVec4, 1);
                 }
                 if (GameVars.boxESP) {
                     ImVec4 boxColorVec4 = ImVec4(GameVars.boxColorArray[0], GameVars.boxColorArray[1], GameVars.boxColorArray[2], GameVars.boxColorArray[3]);
                     if (GameVars.selectedBoxType == 0) {
-                        DrawDynamicBox(Entities.EntityPtr, boxColorVec4);
+                        DrawDynamicBox(Entities, boxColorVec4);
                     }
                     else if (GameVars.selectedBoxType == 1) {
-                        DrawCornerBox(Entities.EntityPtr, boxColorVec4);
+                        DrawCornerBox(Entities, boxColorVec4);
                     }
                 }
             }
             else {
                 if (GameVars.skeletonESP) {
                     ImVec4 skeletonFriendColorVec4 = ImVec4(GameVars.skeletonFrinColorArray[0], GameVars.skeletonFrinColorArray[1], GameVars.skeletonFrinColorArray[2], GameVars.skeletonFrinColorArray[3]);
-                    DrawSkeleton(Entities.EntityPtr, skeletonFriendColorVec4, 1);
+                    DrawSkeleton(Entities, skeletonFriendColorVec4, 1);
                 }
                 if (GameVars.boxESP) {
                     ImVec4 boxFriendColorVec4 = ImVec4(GameVars.boxFrinColorArray[0], GameVars.boxFrinColorArray[1], GameVars.boxFrinColorArray[2], GameVars.boxFrinColorArray[3]);
                     if (GameVars.selectedBoxType == 0) {
-                        DrawDynamicBox(Entities.EntityPtr, boxFriendColorVec4);
+                        DrawDynamicBox(Entities, boxFriendColorVec4);
                     }
                     else if (GameVars.selectedBoxType == 1) {
-                        DrawCornerBox(Entities.EntityPtr, boxFriendColorVec4);
+                        DrawCornerBox(Entities, boxFriendColorVec4);
                     }
                 }
             }
@@ -1925,7 +2223,7 @@ void draw_esp()
                 ImFont* font = ImGui::GetFont();
                 float fontSize = ImGui::GetFontSize();
 
-                std::string itemInHands = Game::GetItemInHands(Entities.EntityPtr);
+                const std::string& itemInHands = Entities.itemInHands;
                 ImVec2 textPos = ImVec2(centeredXPosition - 5, screenPosition.y + 25);
 
                 float outlineThickness = 1.0f;
@@ -1942,7 +2240,7 @@ void draw_esp()
             }
 
             if (GameVars.healESP) {
-                DrawHealth(Entities.EntityPtr);
+                DrawHealth(Entities);
             }
 
             if (GameVars.distanceESP) {
@@ -1978,7 +2276,9 @@ void draw_esp()
 
             if (GameVars.lineESP) {
                 ImVec4 linesColorVec4 = ImVec4(GameVars.linesColorArray[0], GameVars.linesColorArray[1], GameVars.linesColorArray[2], GameVars.linesColorArray[3]);
-                DrawLineESP(Entities.EntityPtr, linesColorVec4, 1);
+                // Use cached bone position (0 DMA)
+                if (Entities.bonesCached && Entities.boneValid[8])
+                    DrawLineESPFromCachedPos(linesColorVec4, Entities.bonePositions[8], GameVars.linep);
             }
 
             if (GameVars.idbones) {
@@ -1987,7 +2287,6 @@ void draw_esp()
         }
 
         else if (entity == xorstr_("dayzinfected") && distance <= GameVars.espzDistance) {
-            DrawLineESP(Entities.EntityPtr, ImColor(255, 0, 0, 255), 1);
             if (GameVars.infectedESP) {
                 int textOffsetY = screenPosition.y + 5;
                 std::string espText = "";
@@ -2029,12 +2328,14 @@ void draw_esp()
 
                 if (GameVars.lineZESP) {
                     ImVec4 linesColorZVec4 = ImVec4(GameVars.linesColorZArray[0], GameVars.linesColorZArray[1], GameVars.linesColorZArray[2], GameVars.linesColorZArray[3]);
-                    DrawLineZESP(Entities.EntityPtr, linesColorZVec4, 1);
+                    // Use cached bone position (0 DMA)
+                    if (Entities.bonesCached && Entities.boneValid[8])
+                        DrawLineESPFromCachedPos(linesColorZVec4, Entities.bonePositions[8], GameVars.linez);
                 }
 
                 if (GameVars.skeletonzESP) {
                     ImVec4 skeletonzColorVec4 = ImVec4(GameVars.skeletonzColorArray[0], GameVars.skeletonzColorArray[1], GameVars.skeletonzColorArray[2], GameVars.skeletonzColorArray[3]);
-                    DrawSkeletonZ(Entities.EntityPtr, skeletonzColorVec4, 1);
+                    DrawSkeletonZ(Entities, skeletonzColorVec4, 1);
                 }
 
                 if (GameVars.idbonesZ) {
@@ -2058,34 +2359,16 @@ void draw_esp()
             }
         }
     }
+    checkSection("EntityLoop");
 
-
-    if (GameVars.itemsESP) {
-        if (GameVars.allitemsESP)
-        {
-            int itemCount = 0;
-            for (const auto& Items : items)
-            {
-                if (itemCount >= 200) break; // Cap to avoid DMA flooding
-
-                Vector3 itemWorldPosition = Game::GetItemCoordinate(Items.ItemPtr);
-                Vector3 itemScreenPosition;
-
-                if (!Game::WorldToScreen(itemWorldPosition, itemScreenPosition))
-                    continue;
-
-                int itemDistance = Game::GetDistanceToMe(itemWorldPosition);
-
-                if (itemDistance <= GameVars.espDistanceitems)
-                {
-                    std::string item = Game::GetItemTypeName(Items.ItemPtr);
-
-                    DrawPlayerText(itemScreenPosition.x, itemScreenPosition.y + 25, ImColor(255, 255, 255, 255), ("[" + std::to_string(itemDistance) + "m] - " + item).c_str());
-                    itemCount++;
-                }
-            }
+    // Log total frame time if it exceeds 50ms
+    {
+        double totalMs = (now_hpc() - frameStart) * toMs;
+        if (totalMs > 16.0) {
+            Log("[ PERF ] TOTAL draw_esp frame: " + std::to_string((int)totalMs) + "ms");
         }
     }
+
 
 
     if (GameVars.citiesESP) {
@@ -2347,9 +2630,6 @@ void draw_esp()
     if (GameVars.tperson) {
         SetThirdPerson(1);
     }
-    else {
-        SetThirdPerson(0);
-    }
 
     if (GameVars.sethour) {
         SetWorldTime(GameVars.dayf);
@@ -2420,9 +2700,32 @@ void keyboard_listener()
 {
     while (true)
     {
-        if (GetAsyncKeyState(VK_INSERT) & 1)
+        if (GetAsyncKeyState(VK_F1) & 1)
         {
             GameVars.menuShow = not GameVars.menuShow;
+        }
+        if (GetAsyncKeyState(VK_F3) & 1)
+        {
+            // Full DMA cache refresh. Guaranteed to catch paged-out entities
+            // that appeared in newly-allocated VA regions (new players entering
+            // the network bubble, streamed-in world content, etc.).
+            //
+            // VMMDLL_OPT_REFRESH_ALL drops ALL caches: full TLB (page table
+            // translations), full memory content cache, process list, and
+            // refreshes every tier. Nothing is left stale — any new virtual
+            // page the game has committed since init will be walked fresh on
+            // the next read.
+            //
+            // Cost: ~8 seconds of stalled DMA reads while the FPGA re-walks
+            // DayZ's page tables. This blocks the main read loop. Use only
+            // when stationary/safe — you will feel the stutter.
+            VMM_HANDLE vmm = globals.vmmManager->getVmm();
+            if (vmm)
+            {
+                Log("[F3] Manual full DMA refresh triggered...");
+                VMMDLL_ConfigSet(vmm, VMMDLL_OPT_REFRESH_ALL, 1);
+                Log("[F3] Refresh complete.");
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

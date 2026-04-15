@@ -3,11 +3,11 @@
 
 #define OFF_TEXT				0x10
 #define OFF_LENGTH				0x8
-#define OFF_World				0xF4B050
+#define OFF_World				0x4263FE8
 #define OFF_NEAR_ENTITY_TABLE	0xF48
 #define OFF_FAR_ENTITY_TABLE	0x1090
 #define OFF_SLOW_ENTITY_TABLE	0x2010
-#define OFF_NETWORK				0xF5E190
+#define OFF_NETWORK				0x100FBD0
 
 #define OFF_CameraOn            0x2968
 #define OFF_NetworkManager      0xEF9148
@@ -24,25 +24,25 @@
 #define OFF_ItemTable           0x2060
 #define OFF_ItemTableSize       0x2068
 #define OFF_playerIsDead        0xE2
-#define OFF_playerNetworkID     0x6E4
-#define OFF_Inventory           0x658
+#define OFF_playerNetworkID     0x6DC
+#define OFF_Inventory           0x650
 #define OFF_Inhands             0x1B0
 #define OFF_InventoryP          0x150
 #define OFF_InventoryPsize      0x15C
-#define OFF_EntityTypeName      0xA8
+#define OFF_EntityTypeName      0xD0
 #define OFF_EntityTypePtr       0x180
-#define OFF_ModelName           0x88
-#define OFF_RealName            0x4f0
+#define OFF_ModelName           0xB0
+#define OFF_RealName            0x518
 #define OFF_VisualState         0x1C8
 #define OFF_GetCoordinate       0x2C
 #define OFF_InventoryI          0x148
 #define OFF_InventoryI2         0x38
 #define OFF_InventoryIsize      0x44
-#define OFF_PlayerSkeleton      0x7E8
-#define OFF_ZmSkeleton          0x678
-#define OFF_MatrixClass         0xBF0
+#define OFF_PlayerSkeleton      0x7E0
+#define OFF_ZmSkeleton          0x670
+#define OFF_MatrixClass         0xBE8
 #define OFF_Matrixb             0x54
-#define OFF_AnimClass           0xB0 //0x98
+#define OFF_AnimClass           0x118
 #define OFF_Day                 0x2974
 #define OFF_Hour				0x2978
 #define OFF_grass               0xC00
@@ -53,13 +53,13 @@
 #define OFF_LocalPlayer3        0x5D0	
 #define OFF_LocalPlayer4        0x28
 #define OFF_Camera              0x1B8
-#define OFF_Tickness            0xF193C8
+#define OFF_Tickness            0xFF4958
 #define OFF_ThirdPerson			0x9C
 
 #define OFF_ObjectBase			0x180 //0x70
-#define OFF_CleanName           0x4F0
-#define OFF_CleanName2			0xA8
-#define OFF_CleanName5			0x88
+#define OFF_CleanName           0x518
+#define OFF_CleanName2			0xD0
+#define OFF_CleanName5			0xB0
 #define OFF_Quality				0x194
 
 // freecam
@@ -78,15 +78,15 @@
 #define LocalPlayerF = 0xF70840;
 
 #define OFF_PlayerName          0xF8
-#define OFF_Network_Manager     0xF5E190
+#define OFF_Network_Manager     0x100FBD0
 #define OFF_Network_Client      0x50
 #define OFF_Network_Table       0x18
 #define OFF_Network_Table_Size  0x1C
 #define OFF_Network_Table_ID    0x30
-#define OFF_Network_ID          0x6E4
-#define OFF_Network_ServerName  0x338
+#define OFF_Network_ID          0x6DC
+#define OFF_Network_ServerName  0x360
 #define OFF_Player_Count        0x24
 
 #define OFF_AMMO_TYPE1          0x6B0
 #define OFF_AMMO_TYPE2          0x20
-#define OFF_AMMOTYPE_INITSPEED  0x364
+#define OFF_AMMOTYPE_INITSPEED  0x38C

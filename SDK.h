@@ -203,7 +203,7 @@ namespace Game
 
 	BOOLEAN GetBonePosition(DWORD64 pSkeleton, DWORD64 pVisual, DWORD index, Vector3& out)
 	{
-		DWORD64 animClass = ReadData<DWORD64>(pSkeleton + 0xA0);
+		DWORD64 animClass = ReadData<DWORD64>(pSkeleton + OFF_AnimClass);
 		if (!ISVALID(animClass)) return FALSE;
 
 		DWORD64 matrixClass = ReadData<DWORD64>(animClass + OFF_AnimClass);
@@ -234,7 +234,7 @@ namespace Game
 	}
 
 	uint64_t GetNetworkManager() {
-		return ReadData<uint64_t>(globals.Base + OFF_Network_Manager);
+		return globals.Base + OFF_Network_Manager;
 	}
 
 	uint64_t GetNetworkClient()
@@ -412,8 +412,11 @@ namespace Game
 
 	uint64_t GetLocalPlayer()
 	{
-		uint64_t cameraOn = ReadData<uint64_t>(globals.World + OFF_CameraOn);
-		return ReadData<uint64_t>(cameraOn + 0x8) - OFF_EntityTypeName;
+		uint64_t localPlayer = ReadData<uint64_t>(globals.World + OFF_LocalPlayer1);
+		if (!localPlayer) return 0;
+		uint64_t localPlayer2 = ReadData<uint64_t>(localPlayer + 0x8);
+		if (!localPlayer2 || localPlayer2 <= 0xA8) return 0;
+		return localPlayer2 - 0xA8;
 	}
 
 	uint64_t GetItemInHands()

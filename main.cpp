@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 #include "overlay.h"
 #include <Windows.h>
 #include <iostream>
@@ -15,19 +16,24 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// Check if target process is still running via DMA (throttled to once per 5 seconds)
+// Check if target process is still running by testing if world pointer is valid (DMA-only, no Windows API)
 void CheckProcess()
 {
     static DWORD lastCheckTick = 0;
+    static int failCount = 0;
     DWORD now = GetTickCount();
     if (now - lastCheckTick < 5000)
         return;
     lastCheckTick = now;
 
-    DWORD pid = globals.staticManager->getPid("DayZ_x64.exe", true);
-    if (!pid)
-    {
-        exit(0);
+    uint64_t test = 0;
+    globals.vmmManager->readMemory(globals.process_id, globals.World, &test, sizeof(test), VMMDLL_FLAG_NOCACHE);
+    if (!test) {
+        failCount++;
+        if (failCount >= 3) // 3 consecutive failures = game is gone
+            exit(0);
+    } else {
+        failCount = 0;
     }
 }
 

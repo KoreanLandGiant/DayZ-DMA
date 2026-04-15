@@ -13,13 +13,13 @@ VMM_HANDLE DMAMem::VmmManager::initialize()
 	VMMDLL_CloseAll();
 	std::cout << " [ + ] Connecting to DMA Card..." << std::endl;
 
-	LPSTR args[] = { LPSTR(""), LPSTR("-device"), LPSTR("fpga://algo=0") };
+	LPSTR args[] = { LPSTR(""), LPSTR("-device"), LPSTR("fpga://algo=0"), LPSTR("-norefresh") };
 
-	VMM_HANDLE handle = VMMDLL_Initialize(3, args);
+	VMM_HANDLE handle = VMMDLL_Initialize(4, args);
 	if (!handle)
 		std::cout << "[ ! ] Vmm Initialization Failed..." << std::endl;
 
-	std::cout << " [ + ] Connected to DMA Card..." << std::endl;
+	std::cout << " [ + ] Connected to DMA Card (auto-refresh disabled)..." << std::endl;
 
 	return handle;
 }

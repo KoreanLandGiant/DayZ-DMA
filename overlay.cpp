@@ -17,6 +17,10 @@
 #include "Imgui/byte.h"
 #include "Imgui/elements.h"
 
+// Defined in main.cpp
+extern void Log(const char* msg);
+extern void Log(const std::string& msg);
+
 enum heads {
 	HEAD_1,
 	HEAD_2,
@@ -53,9 +57,7 @@ IDirect3D9Ex* p_Object = NULL;
 IDirect3DDevice9Ex* p_Device = NULL;
 D3DPRESENT_PARAMETERS p_Params = { NULL };
 
-struct Vector3 {
-	float x, y, z;
-};
+// Vector3 is defined in vector.h (included via globals.h)
 
 void ov::create_window(bool console)
 {
@@ -541,6 +543,14 @@ void ov::render()
 	style.ChildRounding = 5;
 	style.GrabRounding = 3;
 
+	// Frame timing - log every 60 frames unconditionally
+	static LARGE_INTEGER rFreq = {};
+	if (!rFreq.QuadPart) QueryPerformanceFrequency(&rFreq);
+	auto hpc = []() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; };
+	double rMs = 1000.0 / rFreq.QuadPart;
+	auto rStart = hpc();
+	static int frameCount = 0;
+
 	ImGui_ImplDX9_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 
@@ -553,6 +563,8 @@ void ov::render()
 	p_Device->SetRenderState(D3DRS_SCISSORTESTENABLE, false);
 	p_Device->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
 
+	auto rAfterClear = hpc();
+
 	static heads head_selected = HEAD_1;
 	static subheads subhead_selected = SUBHEAD_1;
 
@@ -562,6 +574,7 @@ void ov::render()
 	auto size = ImGui::GetWindowSize();
 
 	draw_esp();
+	auto rAfterESP = hpc();
 
 	if (GameVars.menuShow)
 		{
@@ -904,8 +917,6 @@ void ov::render()
 
 						ImGui::Checkbox(xorstr_("Remove Grass"), &GameVars.grass);
 
-						ImGui::Checkbox(xorstr_("Force Third Person"), &GameVars.tperson);
-
 						ImGui::Checkbox(xorstr_("Hour"), &GameVars.sethour);
 						if (GameVars.sethour) {
 							ImGui::SliderInt(xorstr_("Time"), &GameVars.dayf, 0, 10);
@@ -1154,6 +1165,8 @@ void ov::render()
 
 					ImGui::Checkbox(xorstr_("Corpse Teleport"), &GameVars.CorpseTeleport);
 
+					ImGui::Checkbox(xorstr_("Force Third Person"), &GameVars.tperson);
+
 					if (GameVars.LootTeleport || GameVars.CorpseTeleport) {
 
 						ImGui::Text(xorstr_("TP Key:"));
@@ -1285,6 +1298,14 @@ void ov::render()
 		GameVars.loadConfigRequested = false;
 	}
 
+	// Perf: time the DirectX render/present
+	static LARGE_INTEGER pFreq = {};
+	if (!pFreq.QuadPart) QueryPerformanceFrequency(&pFreq);
+	auto hpc_now = []() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; };
+	double msScale = 1000.0 / pFreq.QuadPart;
+
+	auto t0 = hpc_now();
+
 	if (p_Device->BeginScene() >= 0)
 	{
 		ImGui::Render();
@@ -1293,7 +1314,26 @@ void ov::render()
 		p_Device->EndScene();
 	}
 
+	auto t1 = hpc_now();
+
 	HRESULT result = p_Device->Present(NULL, NULL, NULL, NULL);
+
+	auto t2 = hpc_now();
+
+	// Log frame breakdown every 10 frames to file + console
+	frameCount++;
+	if (frameCount % 10 == 0) {
+		double clearMs = (rAfterClear - rStart) * rMs;
+		double espMs = (rAfterESP - rAfterClear) * rMs;
+		double menuMs = (t0 - rAfterESP) * rMs;
+		double renderMs = (t1 - t0) * msScale;
+		double presentMs = (t2 - t1) * msScale;
+		double totalMs = (t2 - rStart) * rMs;
+		char buf[256];
+		snprintf(buf, sizeof(buf), "[ FRAME %d ] Clear=%.0f ESP=%.0f Menu=%.0f Render=%.0f Present=%.0f TOTAL=%.0fms",
+			frameCount, clearMs, espMs, menuMs, renderMs, presentMs, totalMs);
+		Log(buf);
+	}
 
 	if (result == D3DERR_DEVICELOST && p_Device->TestCooperativeLevel() == D3DERR_DEVICENOTRESET)
 	{
@@ -1308,6 +1348,13 @@ WPARAM ov::loop()
 {
 	MSG msg;
 
+	// Stutter detection: measure time between render() calls
+	static LARGE_INTEGER loopFreq = {};
+	if (!loopFreq.QuadPart) QueryPerformanceFrequency(&loopFreq);
+	auto loop_now = []() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; };
+	double loopToMs = 1000.0 / loopFreq.QuadPart;
+	long long lastRenderEnd = loop_now();
+
 	while (true)
 	{
 		ZeroMemory(&msg, sizeof(MSG));
@@ -1317,7 +1364,17 @@ WPARAM ov::loop()
 			DispatchMessage(&msg);
 		}
 
+		// Detect gap between frames (message pump stalls, DWM, etc)
+		long long beforeRender = loop_now();
+		double gapMs = (beforeRender - lastRenderEnd) * loopToMs;
+		if (gapMs > 50.0) {
+			char gapBuf[128];
+			snprintf(gapBuf, sizeof(gapBuf), "[ !!! RENDER GAP ] %.0fms between frames (msg pump/DWM stall)", gapMs);
+			Log(gapBuf);
+		}
+
 		ov::render();
+		lastRenderEnd = loop_now();
 	}
 	ImGui_ImplDX9_Shutdown();
 	ImGui_ImplWin32_Shutdown();

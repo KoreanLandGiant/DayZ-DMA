@@ -30,4 +30,4 @@ namespace ov
 
 void draw_esp();
 void init();
-void update_list();
+void update_entities();
